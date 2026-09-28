@@ -109,10 +109,65 @@ class Library(BaseModel):
     cran: Optional[str] = None
 
 
+class RunJobTask(BaseModel):
+    job_id: int
+    job_parameters: Optional[Dict[str, str]] = None
+    python_params: Optional[List[str]] = None
+    notebook_params: Optional[Dict[str, str]] = None
+    jar_params: Optional[List[str]] = None
+    spark_submit_params: Optional[List[str]] = None
+
+
+class ConditionTask(BaseModel):
+    left: str
+    op: str
+    right: str
+
+
+class ForEachTask(BaseModel):
+    inputs: str
+    task: "JobTaskSettings"
+    concurrency: Optional[int] = None
+
+
+class TaskDependency(BaseModel):
+    task_key: str
+    outcome: Optional[str] = None
+
+
+class JobsHealthRule(BaseModel):
+    metric: str
+    op: str
+    value: int
+
+
+class JobsHealth(BaseModel):
+    rules: List[JobsHealthRule] = []
+
+
+class WebhookNotificationDestination(BaseModel):
+    id: str
+
+
+class WebhookNotifications(BaseModel):
+    on_start: Optional[List[WebhookNotificationDestination]] = None
+    on_success: Optional[List[WebhookNotificationDestination]] = None
+    on_failure: Optional[List[WebhookNotificationDestination]] = None
+    on_duration_warning_threshold_exceeded: Optional[List[WebhookNotificationDestination]] = None
+    on_streaming_backlog_exceeded: Optional[List[WebhookNotificationDestination]] = None
+
+
+class TaskNotificationSettings(BaseModel):
+    no_alert_for_skipped_runs: Optional[bool] = None
+    no_alert_for_canceled_runs: Optional[bool] = None
+    alert_on_last_attempt: Optional[bool] = None
+
+
 class JobTaskSettings(BaseModel):
     task_key: str
     description: Optional[str] = None
-    depends_on: List[str] = []
+    depends_on: List[TaskDependency] = []
+    run_if: Optional[str] = None
     existing_cluster_id: Optional[str] = None
     new_cluster: Optional[NewCluster] = None
     job_cluster_key: Optional[str] = None
@@ -122,18 +177,66 @@ class JobTaskSettings(BaseModel):
     spark_submit_task: Optional[SparkSubmitTask] = None
     pipeline_task: Optional[PipelineTask] = None
     python_wheel_task: Optional[PythonWheelTask] = None
+    run_job_task: Optional[RunJobTask] = None
+    condition_task: Optional[ConditionTask] = None
+    for_each_task: Optional[ForEachTask] = None
     libraries: List[Library] = []
     email_notifications: Optional[JobEmailNotifications] = None
+    webhook_notifications: Optional[WebhookNotifications] = None
+    notification_settings: Optional[TaskNotificationSettings] = None
+    health: Optional[JobsHealth] = None
+    environment_key: Optional[str] = None
     timeout_seconds: Optional[int] = None
     max_retries: Optional[int] = None
     min_retry_interval_millis: Optional[int] = None
     retry_on_timeout: bool = False
 
 
+ForEachTask.update_forward_refs()
+
+
 class CronSchedule(BaseModel):
     quartz_cron_expression: Optional[str] = None
     timezone_id: Optional[str] = None
     pause_status: Optional[str] = None
+
+
+class FileArrivalTriggerConfiguration(BaseModel):
+    url: str
+    min_time_between_triggers_seconds: Optional[int] = None
+    wait_after_last_change_seconds: Optional[int] = None
+
+
+class TableUpdateTriggerConfiguration(BaseModel):
+    table_names: List[str] = []
+    condition: Optional[str] = None
+    min_time_between_triggers_seconds: Optional[int] = None
+    wait_after_last_change_seconds: Optional[int] = None
+
+
+class PeriodicTriggerConfiguration(BaseModel):
+    interval: int
+    unit: str
+
+
+class TriggerSettings(BaseModel):
+    pause_status: Optional[str] = None
+    file_arrival: Optional[FileArrivalTriggerConfiguration] = None
+    table_update: Optional[TableUpdateTriggerConfiguration] = None
+    periodic: Optional[PeriodicTriggerConfiguration] = None
+
+
+class ContinuousSettings(BaseModel):
+    pause_status: Optional[str] = None
+
+
+class QueueSettings(BaseModel):
+    enabled: bool
+
+
+class JobParameterDefinition(BaseModel):
+    name: str
+    default: str
 
 
 class AccessControlRequestForUser(BaseModel):
@@ -148,11 +251,20 @@ class AccessControlRequestForGroup(BaseModel):
 
 class JobSettings(BaseModel):
     name: str
+    description: Optional[str] = None
     tasks: List[JobTaskSettings]
-    job_clusters: List[JobCluster]
+    job_clusters: List[JobCluster] = []
     email_notifications: Optional[JobEmailNotifications] = None
+    webhook_notifications: Optional[WebhookNotifications] = None
+    notification_settings: Optional[TaskNotificationSettings] = None
+    health: Optional[JobsHealth] = None
     timeout_seconds: Optional[int] = None
-    schedule: Optional[CronSchedule]
+    schedule: Optional[CronSchedule] = None
+    trigger: Optional[TriggerSettings] = None
+    continuous: Optional[ContinuousSettings] = None
+    queue: Optional[QueueSettings] = None
+    parameters: Optional[List[JobParameterDefinition]] = None
+    tags: Optional[Dict[str, str]] = None
     max_concurrent_runs: Optional[int] = None
     format: str = "MULTI_TASK"
     access_control_list: Optional[List[Union[AccessControlRequestForUser, AccessControlRequestForGroup]]] = None
@@ -186,6 +298,11 @@ def get_job_by_id(job_id: str, workspace_url: str):
     return resp.json()
 
 
+def job_settings_body(job: JobSettings) -> dict:
+    """Serialise job settings without unset fields, so each task carries only its own type"""
+    return json.loads(job.json(exclude_none=True))
+
+
 def create_or_update_job(properties: JobProperties, physical_resource_id: Optional[str]) -> JobResponse:
     """Create job at databricks"""
     current: Optional[dict] = None
@@ -193,14 +310,14 @@ def create_or_update_job(properties: JobProperties, physical_resource_id: Option
     if physical_resource_id is not None:
         current = get_job_by_id(physical_resource_id, properties.workspace_url)
     if current is None:
-        create_response = post_request(f"{url}/create", body=json.loads(properties.job.json()))
+        create_response = post_request(f"{url}/create", body=job_settings_body(properties.job))
         job_id = create_response.get("job_id")
         return JobResponse(job_id=job_id, physical_resource_id=job_id)
     else:
         job_id = current.get("job_id")
         reset_body = {
             "job_id": job_id,
-            "new_settings": json.loads(properties.job.json()),
+            "new_settings": job_settings_body(properties.job),
         }
         post_request(f"{url}/reset", body=reset_body)
         return JobResponse(job_id=job_id, physical_resource_id=job_id)
